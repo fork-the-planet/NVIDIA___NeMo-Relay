@@ -89,16 +89,26 @@ jobs:
         with:
           tool: cargo-about@${{ steps.ci-config.outputs.cargo_about_version }}
 
+      - name: Cache pre-commit environments
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/.cache/pre-commit
+          key: >-
+            nemo-flow-pre-commit-${{ runner.os }}-${{ runner.arch }}-py${{ steps.ci-config.outputs.default_python_version }}-node${{ steps.ci-config.outputs.node_version }}-rust${{ steps.ci-config.outputs.rust_version }}-pc${{ steps.ci-config.outputs.pre_commit_version }}-${{ hashFiles('.pre-commit-config.yaml') }}
+          restore-keys: |
+            nemo-flow-pre-commit-${{ runner.os }}-${{ runner.arch }}-py${{ steps.ci-config.outputs.default_python_version }}-node${{ steps.ci-config.outputs.node_version }}-rust${{ steps.ci-config.outputs.rust_version }}-pc${{ steps.ci-config.outputs.pre_commit_version }}-
+
       - name: pre-commit
         working-directory: ${{ env.NEMO_FLOW_CI_WORKSPACE }}
         env:
           FULL_CI: ${{ inputs.full_ci }}
           PRE_COMMIT_BASE: ${{ inputs.base }}
+          PRE_COMMIT_HOME: ${{ runner.temp }}/.cache/pre-commit
           # The attribution hook syncs docs deps; do not apply repo warning policy to third-party Rust builds.
           RUSTFLAGS: ""
         run: |
           set -e
-          uv tool install pre-commit==4.5
+          uv tool install pre-commit==${{ steps.ci-config.outputs.pre_commit_version }}
           if [[ "$FULL_CI" == "true" || -z "$PRE_COMMIT_BASE" ]]; then
             pre-commit run --all-files --show-diff-on-failure
           else
