@@ -22,7 +22,8 @@ type NemoFlowRuntimeKeys =
   | "llmCall"
   | "llmCallEnd"
   | "toolCall"
-  | "toolCallEnd";
+  | "toolCallEnd"
+  | "toolConditionalExecution";
 
 type NemoFlowPluginHostKeys = "defaultConfig" | "validate" | "initialize" | "clear";
 type NemoFlowAdaptiveKeys = "ADAPTIVE_PLUGIN_KIND" | "ComponentSpec";

@@ -138,6 +138,18 @@ describe("Tool replay", () => {
     assert.equal(nf.calls.toolCall.length, 0);
     assert.ok(nf.calls.event.some((event) => event.name === "openclaw.tool_blocked"));
   });
+
+  it("runs tool guardrails even when no session key is available", async () => {
+    const nf = createNemoFlowRuntime();
+    const backend = createBackend(nf);
+
+    await backend.onBeforeToolCall({ toolName: "shell", params: { command: "pwd" } }, {});
+
+    assert.deepEqual(nf.calls.toolConditionalExecution, [
+      { name: "shell", args: { command: "pwd" } },
+    ]);
+    assert.equal(nf.calls.setThreadScopeStack.length, 0);
+  });
 });
 
 type TestNemoFlowRuntime = NemoFlowRuntimeModule & {
@@ -150,6 +162,7 @@ type TestNemoFlowRuntime = NemoFlowRuntimeModule & {
     llmCallEnd: Array<{ handle: unknown; response: unknown }>;
     toolCall: Array<{ name: string; args: unknown; data: unknown }>;
     toolCallEnd: Array<{ handle: unknown; result: unknown; data: unknown }>;
+    toolConditionalExecution: Array<{ name: string; args: unknown }>;
   };
 };
 
@@ -189,6 +202,7 @@ function createNemoFlowRuntime(): TestNemoFlowRuntime {
     llmCallEnd: [],
     toolCall: [],
     toolCallEnd: [],
+    toolConditionalExecution: [],
   };
 
   return {
@@ -216,5 +230,8 @@ function createNemoFlowRuntime(): TestNemoFlowRuntime {
       return handle as unknown as ReturnType<NemoFlowRuntimeModule["toolCall"]>;
     },
     toolCallEnd: (handle, result, data) => calls.toolCallEnd.push({ handle, result, data }),
+    toolConditionalExecution: async (name, args) => {
+      calls.toolConditionalExecution.push({ name, args });
+    },
   };
 }
