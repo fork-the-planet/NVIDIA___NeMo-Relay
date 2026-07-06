@@ -787,40 +787,62 @@ func TestToolExecutionInterceptEmitsPendingMarks(t *testing.T) {
 	mu.Lock()
 	captured := append([]Event(nil), events...)
 	mu.Unlock()
+	assertToolExecutionPendingMarkEvents(t, captured, toolName, markName, category)
+}
 
-	startIndex, endIndex, markIndex := -1, -1, -1
-	var start, mark Event
-	for index, event := range captured {
-		switch {
-		case event.Name() == toolName && event.Kind() == "scope" && event.ScopeCategory() == "start":
-			startIndex, start = index, event
-		case event.Name() == toolName && event.Kind() == "scope" && event.ScopeCategory() == "end":
-			endIndex = index
-		case event.Name() == markName && event.Kind() == "mark":
-			markIndex, mark = index, event
-		}
+func assertToolExecutionPendingMarkEvents(
+	t *testing.T,
+	events []Event,
+	toolName string,
+	markName string,
+	category string,
+) {
+	t.Helper()
+	lifecycle := toolExecutionLifecycleEvents(events, toolName, markName)
+	if lifecycle.startIndex < 0 || lifecycle.endIndex < 0 || lifecycle.markIndex < 0 {
+		t.Fatalf("missing lifecycle events: start=%d end=%d mark=%d", lifecycle.startIndex, lifecycle.endIndex, lifecycle.markIndex)
 	}
-	if startIndex < 0 || endIndex < 0 || markIndex < 0 {
-		t.Fatalf("missing lifecycle events: start=%d end=%d mark=%d", startIndex, endIndex, markIndex)
+	if !(lifecycle.startIndex < lifecycle.endIndex && lifecycle.endIndex < lifecycle.markIndex) {
+		t.Fatalf("unexpected lifecycle order: start=%d end=%d mark=%d", lifecycle.startIndex, lifecycle.endIndex, lifecycle.markIndex)
 	}
-	if !(startIndex < endIndex && endIndex < markIndex) {
-		t.Fatalf("unexpected lifecycle order: start=%d end=%d mark=%d", startIndex, endIndex, markIndex)
+	if lifecycle.mark.ParentUUID() != lifecycle.start.UUID() {
+		t.Fatalf("mark parent %q does not match tool UUID %q", lifecycle.mark.ParentUUID(), lifecycle.start.UUID())
 	}
-	if mark.ParentUUID() != start.UUID() {
-		t.Fatalf("mark parent %q does not match tool UUID %q", mark.ParentUUID(), start.UUID())
+	if lifecycle.mark.Category() != category {
+		t.Fatalf("mark category = %q, expected %q", lifecycle.mark.Category(), category)
 	}
-	if mark.Category() != category {
-		t.Fatalf("mark category = %q, expected %q", mark.Category(), category)
-	}
-	assertJSONFieldString(t, mark.CategoryProfile(), "subtype", "go.tool.execution")
-	assertJSONFieldString(t, mark.Data(), "source", "go")
+	assertJSONFieldString(t, lifecycle.mark.CategoryProfile(), "subtype", "go.tool.execution")
+	assertJSONFieldString(t, lifecycle.mark.Data(), "source", "go")
 	var metadata map[string]any
-	if err := json.Unmarshal(mark.Metadata(), &metadata); err != nil {
+	if err := json.Unmarshal(lifecycle.mark.Metadata(), &metadata); err != nil {
 		t.Fatalf("decode mark metadata: %v", err)
 	}
 	if metadata["fixture"] != true {
-		t.Fatalf("unexpected mark metadata: %s", mark.Metadata())
+		t.Fatalf("unexpected mark metadata: %s", lifecycle.mark.Metadata())
 	}
+}
+
+type toolExecutionLifecycle struct {
+	startIndex int
+	endIndex   int
+	markIndex  int
+	start      Event
+	mark       Event
+}
+
+func toolExecutionLifecycleEvents(events []Event, toolName, markName string) toolExecutionLifecycle {
+	lifecycle := toolExecutionLifecycle{startIndex: -1, endIndex: -1, markIndex: -1}
+	for index, event := range events {
+		switch {
+		case event.Name() == toolName && event.Kind() == "scope" && event.ScopeCategory() == "start":
+			lifecycle.startIndex, lifecycle.start = index, event
+		case event.Name() == toolName && event.Kind() == "scope" && event.ScopeCategory() == "end":
+			lifecycle.endIndex = index
+		case event.Name() == markName && event.Kind() == "mark":
+			lifecycle.markIndex, lifecycle.mark = index, event
+		}
+	}
+	return lifecycle
 }
 
 func TestToolExecutionInterceptSeesNextError(t *testing.T) {
