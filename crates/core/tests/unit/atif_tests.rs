@@ -1789,7 +1789,7 @@ fn test_exporter_openclaw_placeholder_replay_preserves_empty_user_step_and_raw_r
 }
 
 #[test]
-fn test_exporter_openclaw_timing_marks_become_system_steps_with_payloads() {
+fn test_exporter_ignores_openclaw_timing_marks() {
     let exporter = AtifExporter::new("session-1".to_string(), make_agent_info());
     let base = base_timestamp();
 
@@ -1821,40 +1821,14 @@ fn test_exporter_openclaw_timing_marks_become_system_steps_with_payloads() {
     set_event_timestamp(&mut ambiguous, base);
     set_event_timestamp(&mut unpaired, base + chrono::Duration::milliseconds(1));
 
-    {
-        let mut state = exporter.state.lock().unwrap();
-        state.events.extend([ambiguous, unpaired]);
-    }
+    let subscriber = exporter.subscriber();
+    subscriber(&ambiguous);
+    subscriber(&unpaired);
+    assert!(exporter.state.lock().unwrap().events.is_empty());
 
     let trajectory = exporter.export().unwrap();
     assert_atif_v17_shape(&trajectory);
-    assert_eq!(trajectory.steps.len(), 2);
-
-    let ambiguous_step = &trajectory.steps[0];
-    assert_eq!(ambiguous_step.source, "system");
-    assert_eq!(
-        ambiguous_step.message,
-        json!("openclaw.model_call_timing_ambiguous")
-    );
-    let ambiguous_extra: AtifStepExtra =
-        serde_json::from_value(ambiguous_step.extra.clone().unwrap()).unwrap();
-    assert_eq!(
-        ambiguous_extra.event_payload.as_ref(),
-        Some(&ambiguous_payload)
-    );
-
-    let unpaired_step = &trajectory.steps[1];
-    assert_eq!(unpaired_step.source, "system");
-    assert_eq!(
-        unpaired_step.message,
-        json!("openclaw.model_call_timing_unpaired")
-    );
-    let unpaired_extra: AtifStepExtra =
-        serde_json::from_value(unpaired_step.extra.clone().unwrap()).unwrap();
-    assert_eq!(
-        unpaired_extra.event_payload.as_ref(),
-        Some(&unpaired_payload)
-    );
+    assert!(trajectory.steps.is_empty());
 }
 
 #[test]
@@ -2619,16 +2593,15 @@ fn test_exporter_tool_call_id_linking() {
 }
 
 #[test]
-fn test_exporter_mark_steps_include_hook_name_and_ancestry() {
+fn test_exporter_ignores_marks_with_hook_metadata() {
     let exporter = AtifExporter::new("session-1".to_string(), make_agent_info());
     let agent_uuid = Uuid::now_v7();
-    let mark_uuid = Uuid::now_v7();
 
     let agent_start = event_builder(agent_uuid, EventType::Start)
         .name("hermes")
         .scope_type(ScopeType::Agent)
         .build();
-    let mark = event_builder(mark_uuid, EventType::Mark)
+    let mark = event_builder(Uuid::now_v7(), EventType::Mark)
         .name("subagent_end_without_start")
         .parent_uuid(agent_uuid)
         .data(json!({
@@ -2649,25 +2622,7 @@ fn test_exporter_mark_steps_include_hook_name_and_ancestry() {
     }
 
     let trajectory = exporter.export().unwrap();
-    assert_eq!(trajectory.steps.len(), 1);
-
-    let step = &trajectory.steps[0];
-    assert_eq!(step.source, "system");
-    assert_eq!(step.message, json!("subagent_stop"));
-
-    let extra: AtifStepExtra = serde_json::from_value(step.extra.clone().unwrap()).unwrap();
-    assert_eq!(
-        extra.event_payload.as_ref().unwrap()["extra"]["subagent_id"],
-        json!("worker-1")
-    );
-    assert_eq!(extra.ancestry.function_id, mark_uuid.to_string());
-    assert_eq!(extra.ancestry.function_name, "subagent_end_without_start");
-    assert_eq!(extra.ancestry.parent_id, Some(agent_uuid.to_string()));
-    assert_eq!(extra.ancestry.parent_name, Some("hermes".to_string()));
-    assert_eq!(
-        extra.invocation.as_ref().unwrap().invocation_id,
-        Some(mark_uuid.to_string())
-    );
+    assert!(trajectory.steps.is_empty());
 }
 
 #[test]
@@ -2833,10 +2788,11 @@ fn test_exporter_attaches_subagent_ref_to_delegating_tool_observation() {
             "tool_call_id": "call_delegate"
         }))
         .build();
-    let mut child_mark = event_builder(child_mark_uuid, EventType::Mark)
-        .name("worker-started")
+    let mut child_mark = event_builder(child_mark_uuid, EventType::End)
+        .name("worker-llm")
+        .scope_type(ScopeType::Llm)
         .parent_uuid(child_uuid)
-        .data(json!({"status": "started"}))
+        .output(json!({"content": "worker started"}))
         .build();
     let mut child_end = event_builder(child_uuid, EventType::End)
         .name("worker-agent")
@@ -2934,10 +2890,11 @@ fn test_exporter_synthesizes_tool_call_for_active_subagent_dispatch() {
         .parent_uuid(root_uuid)
         .metadata(json!({"session_id": "child-session"}))
         .build();
-    let mut child_mark = event_builder(child_mark_uuid, EventType::Mark)
-        .name("worker-started")
+    let mut child_mark = event_builder(child_mark_uuid, EventType::End)
+        .name("worker-llm")
+        .scope_type(ScopeType::Llm)
         .parent_uuid(child_uuid)
-        .data(json!({"status": "started"}))
+        .output(json!({"content": "worker started"}))
         .build();
     let mut child_end = event_builder(child_uuid, EventType::End)
         .name("worker-agent")
@@ -3257,11 +3214,9 @@ fn test_exporter_renumbers_after_pruning_empty_subagent_ref_step() {
 
     let trajectory = exporter.export().unwrap();
     assert_atif_v17_shape(&trajectory);
-    assert_eq!(trajectory.steps.len(), 2);
+    assert_eq!(trajectory.steps.len(), 1);
     assert_eq!(trajectory.steps[0].step_id, 1);
     assert_eq!(trajectory.steps[0].source, "agent");
-    assert_eq!(trajectory.steps[1].step_id, 2);
-    assert_eq!(trajectory.steps[1].source, "system");
     assert!(trajectory.subagent_trajectories.is_none());
     let serialized = serde_json::to_value(&trajectory).unwrap();
     assert!(!serialized.to_string().contains("subagent_trajectory_ref"));
@@ -3291,10 +3246,11 @@ fn test_exporter_embeds_recursive_subagent_trajectories() {
         .parent_uuid(child_uuid)
         .metadata(json!({"session_id": "grandchild-session"}))
         .build();
-    let mut grandchild_mark = event_builder(Uuid::now_v7(), EventType::Mark)
-        .name("deep-note")
+    let mut grandchild_mark = event_builder(Uuid::now_v7(), EventType::End)
+        .name("deep-llm")
+        .scope_type(ScopeType::Llm)
         .parent_uuid(grandchild_uuid)
-        .data(json!({"status": "ok"}))
+        .output(json!({"content": "deep-note"}))
         .build();
     let mut grandchild_end = event_builder(grandchild_uuid, EventType::End)
         .name("deep-worker")
@@ -3357,13 +3313,10 @@ fn test_exporter_embeds_recursive_subagent_trajectories() {
     assert_eq!(grandchild.steps.len(), 1);
     assert_eq!(grandchild.steps[0].step_id, 1);
     assert_eq!(grandchild.steps[0].message, json!("deep-note"));
-    let extra: AtifStepExtra =
-        serde_json::from_value(grandchild.steps[0].extra.clone().unwrap()).unwrap();
-    assert_eq!(extra.event_payload.as_ref().unwrap()["status"], json!("ok"));
 }
 
 #[test]
-fn test_exporter_skips_empty_mark_payloads() {
+fn test_exporter_skips_all_mark_payloads() {
     let exporter = AtifExporter::new("session-1".to_string(), make_agent_info());
 
     {
@@ -3372,6 +3325,12 @@ fn test_exporter_skips_empty_mark_payloads() {
             event_builder(Uuid::now_v7(), EventType::Mark)
                 .name("empty-object")
                 .data(json!({}))
+                .build(),
+        );
+        state.events.push(
+            event_builder(Uuid::now_v7(), EventType::Mark)
+                .name("populated")
+                .data(json!({"status": "ok"}))
                 .build(),
         );
         state.events.push(
@@ -3391,7 +3350,7 @@ fn test_exporter_skips_empty_mark_payloads() {
 }
 
 #[test]
-fn test_exporter_skips_llm_chunk_marks() {
+fn test_exporter_skips_marks_regardless_of_name() {
     let exporter = AtifExporter::new("session-1".to_string(), make_agent_info());
 
     {
@@ -3419,8 +3378,7 @@ fn test_exporter_skips_llm_chunk_marks() {
 
     let trajectory = exporter.export().unwrap();
 
-    assert_eq!(trajectory.steps.len(), 1);
-    assert_eq!(trajectory.steps[0].message, json!("agent.status"));
+    assert!(trajectory.steps.is_empty());
 }
 
 #[test]
@@ -4001,8 +3959,9 @@ fn test_exporter_clear() {
     {
         let mut state = exporter.state.lock().unwrap();
         state.events.push(
-            event_builder(Uuid::now_v7(), EventType::Mark)
-                .data(json!("test"))
+            event_builder(Uuid::now_v7(), EventType::End)
+                .scope_type(ScopeType::Llm)
+                .output(json!("test"))
                 .build(),
         );
     }

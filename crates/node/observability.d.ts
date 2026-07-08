@@ -56,6 +56,8 @@ export interface AtifConfig {
 
 export interface OtlpConfig {
   enabled?: boolean;
+  mark_projection?: 'inherit' | 'event' | 'tool';
+  mark_exclude_names?: string[];
   transport?: 'http_binary' | 'grpc' | string;
   endpoint?: string;
   headers?: Record<string, string>;

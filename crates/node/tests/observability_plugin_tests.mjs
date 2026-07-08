@@ -29,12 +29,15 @@ describe('observability plugin helpers', () => {
     });
     assert.deepEqual(observability.otlpConfig(), {
       enabled: false,
+      mark_projection: 'inherit',
+      mark_exclude_names: ['llm.chunk'],
       transport: 'http_binary',
       headers: {},
       resource_attributes: {},
       service_name: 'nemo-relay',
       timeout_millis: 3000,
     });
+    assert.equal(observability.otlpConfig({ mark_projection: 'tool' }).mark_projection, 'tool');
 
     const component = observability.ComponentSpec({ version: 1, atof: observability.atofConfig() });
     assert.equal(component.kind, observability.OBSERVABILITY_PLUGIN_KIND);

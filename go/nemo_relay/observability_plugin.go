@@ -8,6 +8,18 @@ import "encoding/json"
 // ObservabilityPluginKind is the top-level plugin kind used by the core observability component.
 const ObservabilityPluginKind = "observability"
 
+// ObservabilityMarkProjection controls how point-in-time marks are exported.
+type ObservabilityMarkProjection string
+
+const (
+	// ObservabilityMarkProjectionInherit preserves exporter-native mark handling.
+	ObservabilityMarkProjectionInherit ObservabilityMarkProjection = "inherit"
+	// ObservabilityMarkProjectionEvent preserves marks as events.
+	ObservabilityMarkProjectionEvent ObservabilityMarkProjection = "event"
+	// ObservabilityMarkProjectionTool emits visible tool projections.
+	ObservabilityMarkProjectionTool ObservabilityMarkProjection = "tool"
+)
+
 // ObservabilityConfig is the canonical Go shape for the observability plugin config document.
 type ObservabilityConfig struct {
 	Version       uint32                   `json:"version,omitempty"`
@@ -128,16 +140,42 @@ func (config ObservabilityHttpStorageConfig) MarshalJSON() ([]byte, error) {
 
 // ObservabilityOtlpConfig configures OpenTelemetry or OpenInference OTLP export.
 type ObservabilityOtlpConfig struct {
-	Enabled              bool              `json:"enabled,omitempty"`
-	Transport            string            `json:"transport,omitempty"`
-	Endpoint             string            `json:"endpoint,omitempty"`
-	Headers              map[string]string `json:"headers,omitempty"`
-	ResourceAttributes   map[string]string `json:"resource_attributes,omitempty"`
-	ServiceName          string            `json:"service_name,omitempty"`
-	ServiceNamespace     string            `json:"service_namespace,omitempty"`
-	ServiceVersion       string            `json:"service_version,omitempty"`
-	InstrumentationScope string            `json:"instrumentation_scope,omitempty"`
-	TimeoutMillis        uint64            `json:"timeout_millis,omitempty"`
+	Enabled              bool                        `json:"enabled,omitempty"`
+	MarkProjection       ObservabilityMarkProjection `json:"mark_projection,omitempty"`
+	MarkExcludeNames     []string                    `json:"mark_exclude_names,omitempty"`
+	Transport            string                      `json:"transport,omitempty"`
+	Endpoint             string                      `json:"endpoint,omitempty"`
+	Headers              map[string]string           `json:"headers,omitempty"`
+	ResourceAttributes   map[string]string           `json:"resource_attributes,omitempty"`
+	ServiceName          string                      `json:"service_name,omitempty"`
+	ServiceNamespace     string                      `json:"service_namespace,omitempty"`
+	ServiceVersion       string                      `json:"service_version,omitempty"`
+	InstrumentationScope string                      `json:"instrumentation_scope,omitempty"`
+	TimeoutMillis        uint64                      `json:"timeout_millis,omitempty"`
+}
+
+// MarshalJSON preserves the distinction between a nil exclusion list, which
+// inherits the core default, and an explicitly empty list, which disables all
+// default exclusions.
+func (config ObservabilityOtlpConfig) MarshalJSON() ([]byte, error) {
+	type alias ObservabilityOtlpConfig
+	payload, err := json.Marshal(alias(config))
+	if err != nil {
+		return nil, err
+	}
+
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &object); err != nil {
+		return nil, err
+	}
+	if config.MarkExcludeNames != nil {
+		exclusions, err := json.Marshal(config.MarkExcludeNames)
+		if err != nil {
+			return nil, err
+		}
+		object["mark_exclude_names"] = exclusions
+	}
+	return json.Marshal(object)
 }
 
 // ObservabilityComponentSpec wraps one observability config as a top-level plugin component.
@@ -181,6 +219,8 @@ func NewObservabilityHttpStorageConfig(endpoint string) ObservabilityHttpStorage
 func NewObservabilityOtlpConfig() ObservabilityOtlpConfig {
 	return ObservabilityOtlpConfig{
 		Transport:          "http_binary",
+		MarkProjection:     ObservabilityMarkProjectionInherit,
+		MarkExcludeNames:   []string{"llm.chunk"},
 		Headers:            map[string]string{},
 		ResourceAttributes: map[string]string{},
 		ServiceName:        "nemo-relay",

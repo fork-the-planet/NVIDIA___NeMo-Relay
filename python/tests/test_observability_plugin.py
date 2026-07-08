@@ -38,12 +38,15 @@ class TestObservabilityConfigHelpers:
         }
         assert OtlpConfig().to_dict() == {
             "enabled": False,
+            "mark_projection": "inherit",
+            "mark_exclude_names": ["llm.chunk"],
             "transport": "http_binary",
             "headers": {},
             "resource_attributes": {},
             "service_name": "nemo-relay",
             "timeout_millis": 3000,
         }
+        assert OtlpConfig(mark_projection="tool").to_dict()["mark_projection"] == "tool"
 
         wrapped = ComponentSpec(ObservabilityConfig(atof=AtofConfig())).to_dict()
         assert wrapped["kind"] == OBSERVABILITY_PLUGIN_KIND

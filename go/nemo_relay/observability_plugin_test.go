@@ -64,12 +64,14 @@ func TestObservabilityConfigHelpers(t *testing.T) {
 		httpStorage,
 	}
 	otlp := NewObservabilityOtlpConfig()
-	if otlp.Enabled || otlp.Transport != "http_binary" || otlp.ServiceName != "nemo-relay" || otlp.TimeoutMillis != 3000 {
+	if otlp.Enabled || otlp.MarkProjection != ObservabilityMarkProjectionInherit || len(otlp.MarkExcludeNames) != 1 || otlp.MarkExcludeNames[0] != "llm.chunk" || otlp.Transport != "http_binary" || otlp.ServiceName != "nemo-relay" || otlp.TimeoutMillis != 3000 {
 		t.Fatalf("unexpected OTLP defaults: %#v", otlp)
 	}
+	otlp.MarkProjection = ObservabilityMarkProjectionTool
 
 	config.Atof = &atof
 	config.Atif = &atif
+	config.OpenTelemetry = &otlp
 	wrapped := ObservabilityComponent(config)
 	if wrapped.Kind != ObservabilityPluginKind || !wrapped.Enabled {
 		t.Fatalf("unexpected component wrapper: %#v", wrapped)
@@ -94,6 +96,29 @@ func TestObservabilityConfigHelpers(t *testing.T) {
 		t.Fatalf("expected field_name_policy in serialized component, got %s", serialized)
 	}
 	assertWrappedAtifStorageConfig(t, wrapped.Config["atif"].(map[string]any))
+	if wrapped.Config["opentelemetry"].(map[string]any)["mark_projection"] != "tool" {
+		t.Fatalf("expected tool mark projection in serialized config: %#v", wrapped.Config)
+	}
+}
+
+func TestObservabilityOtlpConfigPreservesExplicitEmptyMarkExclusions(t *testing.T) {
+	inherited, err := json.Marshal(ObservabilityOtlpConfig{})
+	if err != nil {
+		t.Fatalf("marshal zero-value OTLP config failed: %v", err)
+	}
+	if strings.Contains(string(inherited), `"mark_exclude_names"`) {
+		t.Fatalf("nil exclusions should inherit the core default: %s", inherited)
+	}
+
+	config := NewObservabilityOtlpConfig()
+	config.MarkExcludeNames = []string{}
+	explicitEmpty, err := json.Marshal(config)
+	if err != nil {
+		t.Fatalf("marshal OTLP config with empty exclusions failed: %v", err)
+	}
+	if !strings.Contains(string(explicitEmpty), `"mark_exclude_names":[]`) {
+		t.Fatalf("explicit empty exclusions should be preserved: %s", explicitEmpty)
+	}
 }
 
 func assertS3StorageConfig(t *testing.T, storage ObservabilityS3StorageConfig) {

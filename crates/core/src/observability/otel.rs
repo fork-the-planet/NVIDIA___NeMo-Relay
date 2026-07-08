@@ -7,7 +7,7 @@
 //!
 //! - scope/tool/LLM `Start` events open spans
 //! - matching `End` events close spans
-//! - `Mark` events become span events on the active parent span when possible
+//! - `Mark` events become span events by default, with an optional visible child-span projection
 //! - orphan marks fall back to zero-duration spans so they still reach OTLP
 //!
 //! The public API is intentionally small:
@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{
+    MarkProjection, default_mark_exclude_names, effective_mark_projection,
     estimate_cost_for_response_or_model, estimate_cost_for_response_or_requested_model, manual,
     model_name_for_llm_event,
 };
@@ -95,6 +96,8 @@ pub struct OpenTelemetryConfig {
     service_namespace: Option<String>,
     service_version: Option<String>,
     instrumentation_scope: String,
+    mark_projection: MarkProjection,
+    mark_exclude_names: Vec<String>,
     timeout: Duration,
     transport: OtlpTransport,
 }
@@ -109,6 +112,8 @@ impl Default for OpenTelemetryConfig {
             service_namespace: None,
             service_version: None,
             instrumentation_scope: "nemo-relay-otel".to_string(),
+            mark_projection: MarkProjection::default(),
+            mark_exclude_names: default_mark_exclude_names(),
             timeout: Duration::from_secs(3),
             transport: OtlpTransport::HttpBinary,
         }
@@ -179,6 +184,24 @@ impl OpenTelemetryConfig {
         self.instrumentation_scope = scope.into();
         self
     }
+
+    /// Selects how point-in-time marks are represented in exported traces.
+    pub fn with_mark_projection(mut self, mark_projection: MarkProjection) -> Self {
+        self.mark_projection = mark_projection;
+        self
+    }
+
+    /// Excludes named marks from tool projection while preserving their native
+    /// event representation. The default excludes high-volume `llm.chunk`
+    /// marks.
+    pub fn with_mark_exclude_names<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.mark_exclude_names = names.into_iter().map(Into::into).collect();
+        self
+    }
 }
 
 /// OpenTelemetry-backed NeMo Relay subscriber.
@@ -204,6 +227,8 @@ impl OpenTelemetrySubscriber {
         Ok(Self::from_tracer_provider_with_scope(
             provider,
             config.instrumentation_scope,
+            config.mark_projection,
+            config.mark_exclude_names,
         ))
     }
 
@@ -212,17 +237,61 @@ impl OpenTelemetrySubscriber {
         provider: SdkTracerProvider,
         instrumentation_scope: impl Into<String>,
     ) -> Self {
-        Self::from_tracer_provider_with_scope(provider, instrumentation_scope.into())
+        Self::from_tracer_provider_with_scope(
+            provider,
+            instrumentation_scope.into(),
+            MarkProjection::default(),
+            default_mark_exclude_names(),
+        )
+    }
+
+    /// Builds a subscriber from a tracer provider with an explicit mark projection.
+    pub fn from_tracer_provider_with_mark_projection(
+        provider: SdkTracerProvider,
+        instrumentation_scope: impl Into<String>,
+        mark_projection: MarkProjection,
+    ) -> Self {
+        Self::from_tracer_provider_with_scope(
+            provider,
+            instrumentation_scope.into(),
+            mark_projection,
+            default_mark_exclude_names(),
+        )
+    }
+
+    /// Builds a subscriber with explicit mark projection and exclusion names.
+    pub fn from_tracer_provider_with_mark_projection_and_exclusions<I, S>(
+        provider: SdkTracerProvider,
+        instrumentation_scope: impl Into<String>,
+        mark_projection: MarkProjection,
+        mark_exclude_names: I,
+    ) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self::from_tracer_provider_with_scope(
+            provider,
+            instrumentation_scope.into(),
+            mark_projection,
+            mark_exclude_names.into_iter().map(Into::into).collect(),
+        )
     }
 
     fn from_tracer_provider_with_scope(
         provider: SdkTracerProvider,
         instrumentation_scope: String,
+        mark_projection: MarkProjection,
+        mark_exclude_names: Vec<String>,
     ) -> Self {
-        let processor = Arc::new(Mutex::new(OtelEventProcessor::new(
-            provider,
-            instrumentation_scope,
-        )));
+        let processor = Arc::new(Mutex::new(
+            OtelEventProcessor::new_with_mark_projection_and_exclusions(
+                provider,
+                instrumentation_scope,
+                mark_projection,
+                mark_exclude_names,
+            ),
+        ));
         let processor_for_callback = Arc::clone(&processor);
         let subscriber: EventSubscriberFn = Arc::new(move |event: &Event| {
             let Ok(mut guard) = processor_for_callback.lock() else {
@@ -375,10 +444,36 @@ struct OtelEventProcessor {
     completed_span_order: VecDeque<Uuid>,
     provider: SdkTracerProvider,
     tracer: SdkTracer,
+    mark_projection: MarkProjection,
+    mark_exclude_names: Vec<String>,
 }
 
 impl OtelEventProcessor {
+    #[cfg(test)]
     fn new(provider: SdkTracerProvider, instrumentation_scope: String) -> Self {
+        Self::new_with_mark_projection(provider, instrumentation_scope, MarkProjection::default())
+    }
+
+    #[cfg(test)]
+    fn new_with_mark_projection(
+        provider: SdkTracerProvider,
+        instrumentation_scope: String,
+        mark_projection: MarkProjection,
+    ) -> Self {
+        Self::new_with_mark_projection_and_exclusions(
+            provider,
+            instrumentation_scope,
+            mark_projection,
+            default_mark_exclude_names(),
+        )
+    }
+
+    fn new_with_mark_projection_and_exclusions(
+        provider: SdkTracerProvider,
+        instrumentation_scope: String,
+        mark_projection: MarkProjection,
+        mark_exclude_names: Vec<String>,
+    ) -> Self {
         let tracer = provider.tracer(instrumentation_scope);
         Self {
             active_spans: HashMap::new(),
@@ -386,6 +481,8 @@ impl OtelEventProcessor {
             completed_span_order: VecDeque::new(),
             provider,
             tracer,
+            mark_projection,
+            mark_exclude_names,
         }
     }
 
@@ -437,6 +534,12 @@ impl OtelEventProcessor {
     }
 
     fn process_mark(&mut self, event: &Event) {
+        if effective_mark_projection(event, self.mark_projection, &self.mark_exclude_names)
+            == MarkProjection::Tool
+        {
+            self.process_mark_as_tool(event);
+            return;
+        }
         let mark_name = event.name().to_string();
         let timestamp = to_system_time(*event.timestamp());
         let attributes = mark_attributes(event);
@@ -457,6 +560,26 @@ impl OtelEventProcessor {
         let mut span_attributes = attributes;
         span_attributes.push(KeyValue::new("nemo_relay.mark.orphan", true));
         span.set_attributes(span_attributes);
+        span.end_with_timestamp(timestamp);
+    }
+
+    fn process_mark_as_tool(&mut self, event: &Event) {
+        let timestamp = to_system_time(*event.timestamp());
+        let orphan = self.find_parent_span(event).is_none();
+        let mut attributes = mark_attributes(event);
+        attributes.push(KeyValue::new("nemo_relay.mark.projection", "tool"));
+        attributes.push(KeyValue::new("nemo_relay.scope_type", "tool"));
+        if orphan {
+            attributes.push(KeyValue::new("nemo_relay.mark.orphan", true));
+        }
+
+        let mut span = self
+            .tracer
+            .span_builder(format!("mark:{}", event.name()))
+            .with_kind(SpanKind::Internal)
+            .with_start_time(timestamp)
+            .start_with_context(&self.tracer, &self.parent_context(event));
+        span.set_attributes(attributes);
         span.end_with_timestamp(timestamp);
     }
 
@@ -644,6 +767,17 @@ fn mark_attributes(event: &Event) -> Vec<KeyValue> {
         &mut attributes,
         "nemo_relay.mark.metadata_json",
         event.metadata(),
+    );
+    if let Some(category) = event.category() {
+        attributes.push(KeyValue::new(
+            "nemo_relay.mark.category",
+            category.as_str().to_string(),
+        ));
+    }
+    push_serialized(
+        &mut attributes,
+        "nemo_relay.mark.category_profile_json",
+        event.category_profile(),
     );
     attributes
 }

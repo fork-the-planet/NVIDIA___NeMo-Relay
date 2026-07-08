@@ -466,6 +466,8 @@ fn config_defaults_and_builder_overrides_are_applied() {
         .with_service_namespace("agents")
         .with_service_version("1.2.3")
         .with_instrumentation_scope("demo-scope")
+        .with_mark_projection(MarkProjection::Tool)
+        .with_mark_exclude_names(["notification", "hook_mark"])
         .with_timeout(Duration::from_millis(1250));
 
     assert_eq!(config.transport, OtlpTransport::HttpBinary);
@@ -485,12 +487,16 @@ fn config_defaults_and_builder_overrides_are_applied() {
     assert_eq!(config.service_namespace.as_deref(), Some("agents"));
     assert_eq!(config.service_version.as_deref(), Some("1.2.3"));
     assert_eq!(config.instrumentation_scope, "demo-scope");
+    assert_eq!(config.mark_projection, MarkProjection::Tool);
+    assert_eq!(config.mark_exclude_names, vec!["notification", "hook_mark"]);
     assert_eq!(config.timeout, Duration::from_millis(1250));
 
     let defaults = OpenInferenceConfig::default();
     assert_eq!(defaults.transport, OtlpTransport::HttpBinary);
     assert_eq!(defaults.service_name, "nemo-relay");
     assert_eq!(defaults.instrumentation_scope, "nemo-relay-openinference");
+    assert_eq!(defaults.mark_projection, MarkProjection::Inherit);
+    assert_eq!(defaults.mark_exclude_names, vec!["llm.chunk"]);
     assert_eq!(defaults.timeout, Duration::from_secs(3));
     assert!(defaults.headers.is_empty());
     assert!(defaults.resource_attributes.is_empty());
@@ -2099,6 +2105,192 @@ fn orphan_marks_become_zero_duration_spans() {
 }
 
 #[test]
+fn tool_projection_emits_generic_mark_as_parented_openinference_tool_span() {
+    let (provider, exporter) = make_provider();
+    let mut processor = OpenInferenceEventProcessor::new_with_mark_projection(
+        provider.clone(),
+        "test-scope".to_string(),
+        MarkProjection::Tool,
+    );
+    let parent_uuid = Uuid::now_v7();
+    let start = make_start_event(parent_uuid, None, "agent-turn", ScopeType::Agent, None);
+    let mark = Event::Mark(MarkEvent::new(
+        BaseEvent::builder()
+            .parent_uuid(parent_uuid)
+            .name("plugin.output_compacted")
+            .data(json!({"count": 3}))
+            .build(),
+        Some(EventCategory::custom()),
+        Some(
+            CategoryProfile::builder()
+                .subtype("example.compaction")
+                .build(),
+        ),
+    ));
+    let end = make_end_event(parent_uuid, None, "agent-turn", ScopeType::Agent, None);
+
+    processor.process(&start);
+    processor.process(&mark);
+    processor.process(&end);
+    processor.force_flush().unwrap();
+
+    let spans = exporter.get_finished_spans().unwrap();
+    assert_eq!(spans.len(), 2);
+    let parent = spans
+        .iter()
+        .find(|span| span.name.as_ref() == "agent-turn")
+        .unwrap();
+    let projected = spans
+        .iter()
+        .find(|span| span.name.as_ref() == "mark:plugin.output_compacted")
+        .unwrap();
+    assert!(parent.events.events.is_empty());
+    assert_eq!(projected.parent_span_id, parent.span_context.span_id());
+    assert_eq!(projected.start_time, projected.end_time);
+
+    let attributes = attr_map(&projected.attributes);
+    assert_eq!(
+        attributes.get("openinference.span.kind"),
+        Some(&"TOOL".to_string())
+    );
+    assert_eq!(
+        attributes.get("nemo_relay.mark.projection"),
+        Some(&"tool".to_string())
+    );
+    assert_eq!(
+        attributes.get("nemo_relay.mark.data_json"),
+        Some(&"{\"count\":3}".to_string())
+    );
+    assert_eq!(
+        attributes.get("nemo_relay.mark.category"),
+        Some(&"custom".to_string())
+    );
+    assert_eq!(
+        attributes.get("nemo_relay.mark.category_profile_json"),
+        Some(&"{\"subtype\":\"example.compaction\"}".to_string())
+    );
+    assert!(!attributes.contains_key("nemo_relay.mark.orphan"));
+}
+
+#[test]
+fn tool_projection_exclusion_keeps_custom_mark_as_native_event() {
+    let (provider, exporter) = make_provider();
+    let mut processor = OpenInferenceEventProcessor::new_with_mark_projection_and_exclusions(
+        provider.clone(),
+        "test-scope".to_string(),
+        MarkProjection::Tool,
+        vec!["plugin.excluded".to_string()],
+    );
+    processor.process(&make_mark_event(
+        None,
+        "plugin.excluded",
+        Some(json!({"count": 3})),
+    ));
+    processor.force_flush().unwrap();
+
+    let spans = exporter.get_finished_spans().unwrap();
+    assert_eq!(spans.len(), 1);
+    let attributes = attr_map(&spans[0].attributes);
+    assert!(!attributes.contains_key("nemo_relay.mark.projection"));
+    assert_eq!(
+        attributes.get("openinference.span.kind"),
+        Some(&"CHAIN".to_string())
+    );
+}
+
+#[test]
+fn tool_projection_reuses_completed_parent_context_for_late_marks() {
+    let (provider, exporter) = make_provider();
+    let mut processor = OpenInferenceEventProcessor::new_with_mark_projection(
+        provider.clone(),
+        "test-scope".to_string(),
+        MarkProjection::Tool,
+    );
+    let parent_uuid = Uuid::now_v7();
+
+    processor.process(&make_start_event(
+        parent_uuid,
+        None,
+        "completed-tool",
+        ScopeType::Tool,
+        None,
+    ));
+    processor.process(&make_end_event(
+        parent_uuid,
+        None,
+        "completed-tool",
+        ScopeType::Tool,
+        None,
+    ));
+    processor.process(&make_mark_event(
+        Some(parent_uuid),
+        "plugin.late_checkpoint",
+        Some(json!({"status": "complete"})),
+    ));
+    processor.force_flush().unwrap();
+
+    let spans = exporter.get_finished_spans().unwrap();
+    let parent = spans
+        .iter()
+        .find(|span| span.name.as_ref() == "completed-tool")
+        .unwrap();
+    let projected = spans
+        .iter()
+        .find(|span| span.name.as_ref() == "mark:plugin.late_checkpoint")
+        .unwrap();
+    assert_eq!(projected.parent_span_id, parent.span_context.span_id());
+    assert_eq!(
+        projected.span_context.trace_id(),
+        parent.span_context.trace_id()
+    );
+    let attributes = attr_map(&projected.attributes);
+    assert_eq!(
+        attributes.get("nemo_relay.mark.orphan"),
+        Some(&"true".to_string())
+    );
+    assert_eq!(
+        attributes.get("openinference.span.kind"),
+        Some(&"TOOL".to_string())
+    );
+}
+
+#[test]
+fn tool_projection_keeps_llm_chunks_as_parent_span_events() {
+    let (provider, exporter) = make_provider();
+    let mut processor = OpenInferenceEventProcessor::new_with_mark_projection(
+        provider.clone(),
+        "test-scope".to_string(),
+        MarkProjection::Tool,
+    );
+    let parent_uuid = Uuid::now_v7();
+    let start = make_start_event(parent_uuid, None, "llm", ScopeType::Llm, None);
+    let chunk = make_mark_event(Some(parent_uuid), "llm.chunk", Some(json!({"delta": "x"})));
+    let aliased_chunk = Event::Mark(MarkEvent::new(
+        BaseEvent::builder()
+            .parent_uuid(parent_uuid)
+            .name("hook_mark")
+            .metadata(json!({"hook_event_name": "llm.chunk"}))
+            .data(json!({"delta": "y"}))
+            .build(),
+        None,
+        None,
+    ));
+    let end = make_end_event(parent_uuid, None, "llm", ScopeType::Llm, None);
+
+    processor.process(&start);
+    processor.process(&chunk);
+    processor.process(&aliased_chunk);
+    processor.process(&end);
+    processor.force_flush().unwrap();
+
+    let spans = exporter.get_finished_spans().unwrap();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].events.events.len(), 2);
+    assert_eq!(spans[0].events.events[0].name.as_ref(), "llm.chunk");
+    assert_eq!(spans[0].events.events[1].name.as_ref(), "hook_mark");
+}
+
+#[test]
 fn late_parented_marks_reuse_completed_parent_trace_context() {
     let (provider, exporter) = make_provider();
     let mut processor =
@@ -2121,7 +2313,7 @@ fn late_parented_marks_reuse_completed_parent_trace_context() {
     ));
     processor.process(&make_mark_event(
         Some(tool_uuid),
-        "visor.tool_output_compressed",
+        "plugin.output_compacted",
         Some(json!({"estimated_tokens_saved": 42})),
     ));
     processor.force_flush().unwrap();
@@ -2134,7 +2326,7 @@ fn late_parented_marks_reuse_completed_parent_trace_context() {
         .unwrap();
     let mark_span = spans
         .iter()
-        .find(|span| span.name.as_ref() == "mark:visor.tool_output_compressed")
+        .find(|span| span.name.as_ref() == "mark:plugin.output_compacted")
         .unwrap();
 
     assert_eq!(

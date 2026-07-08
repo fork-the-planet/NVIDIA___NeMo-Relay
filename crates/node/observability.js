@@ -57,6 +57,8 @@ function atifConfig(config = {}) {
 function otlpConfig(config = {}) {
   return {
     enabled: false,
+    mark_projection: 'inherit',
+    mark_exclude_names: ['llm.chunk'],
     transport: 'http_binary',
     headers: {},
     resource_attributes: {},

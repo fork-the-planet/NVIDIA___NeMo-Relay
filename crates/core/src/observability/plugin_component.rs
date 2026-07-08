@@ -51,6 +51,7 @@ use crate::observability::openinference::{
 use crate::observability::otel::{
     OpenTelemetryConfig as CoreOpenTelemetryConfig, OpenTelemetrySubscriber,
 };
+use crate::observability::{MarkProjection, default_mark_exclude_names};
 use crate::plugin::{
     ConfigDiagnostic, ConfigPolicy, DiagnosticLevel, Plugin, PluginComponentSpec, PluginError,
     PluginRegistration, PluginRegistrationContext, Result as PluginResult, UnsupportedBehavior,
@@ -374,6 +375,13 @@ pub struct OtlpSectionConfig {
     /// Whether the subscriber is active.
     #[serde(default)]
     pub enabled: bool,
+    /// Representation used for mark events: `inherit`, `event`, or `tool`.
+    #[serde(default)]
+    #[cfg_attr(feature = "schema", schemars(schema_with = "mark_projection_schema"))]
+    pub mark_projection: MarkProjection,
+    /// Mark names excluded from tool projection. Defaults to `llm.chunk`.
+    #[serde(default = "default_mark_exclude_names")]
+    pub mark_exclude_names: Vec<String>,
     /// OTLP transport: `http_binary` or `grpc`.
     #[serde(default = "default_otlp_transport")]
     #[cfg_attr(feature = "schema", schemars(schema_with = "otlp_transport_schema"))]
@@ -408,6 +416,8 @@ impl Default for OtlpSectionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            mark_projection: MarkProjection::default(),
+            mark_exclude_names: default_mark_exclude_names(),
             transport: default_otlp_transport(),
             endpoint: None,
             headers: HashMap::new(),
@@ -487,6 +497,8 @@ crate::editor_config! {
 crate::editor_config! {
     impl OtlpSectionConfig {
         enabled => { label: "enabled", kind: Boolean },
+        mark_projection => { label: "mark_projection", kind: Enum, values: ["inherit", "event", "tool"] },
+        mark_exclude_names => { label: "mark_exclude_names", kind: Json },
         transport => { label: "transport", kind: Enum, values: ["http_binary", "grpc"] },
         endpoint => { label: "endpoint", kind: String, optional: true },
         headers => { label: "headers", kind: StringMap },
@@ -579,6 +591,13 @@ fn otlp_transport_schema(
     generator: &mut schemars::r#gen::SchemaGenerator,
 ) -> schemars::schema::Schema {
     string_enum_schema(generator, &["http_binary", "grpc"], Some("http_binary"))
+}
+
+#[cfg(feature = "schema")]
+fn mark_projection_schema(
+    generator: &mut schemars::r#gen::SchemaGenerator,
+) -> schemars::schema::Schema {
+    string_enum_schema(generator, &["inherit", "event", "tool"], Some("inherit"))
 }
 
 #[cfg(feature = "schema")]
@@ -1347,6 +1366,9 @@ fn build_otel_config(section: OtlpSectionConfig) -> PluginResult<CoreOpenTelemet
         }
     }
     .with_timeout(Duration::from_millis(section.timeout_millis));
+    config = config
+        .with_mark_projection(section.mark_projection)
+        .with_mark_exclude_names(section.mark_exclude_names);
 
     if let Some(endpoint) = section.endpoint {
         config = config.with_endpoint(endpoint);
@@ -1383,7 +1405,9 @@ fn build_openinference_config(section: OtlpSectionConfig) -> PluginResult<CoreOp
     let mut config = CoreOpenInferenceConfig::new()
         .with_transport(transport)
         .with_service_name(section.service_name)
-        .with_timeout(Duration::from_millis(section.timeout_millis));
+        .with_timeout(Duration::from_millis(section.timeout_millis))
+        .with_mark_projection(section.mark_projection)
+        .with_mark_exclude_names(section.mark_exclude_names);
 
     if let Some(endpoint) = section.endpoint {
         config = config.with_endpoint(endpoint);
@@ -1503,6 +1527,8 @@ fn validate_observability_section_fields(
         "opentelemetry",
         &[
             "enabled",
+            "mark_projection",
+            "mark_exclude_names",
             "transport",
             "endpoint",
             "headers",
@@ -1521,6 +1547,8 @@ fn validate_observability_section_fields(
         "openinference",
         &[
             "enabled",
+            "mark_projection",
+            "mark_exclude_names",
             "transport",
             "endpoint",
             "headers",

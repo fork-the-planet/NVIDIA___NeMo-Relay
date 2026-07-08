@@ -122,21 +122,48 @@ fn schema_has_property(schema: &Json, name: &str) -> bool {
 
 #[cfg(feature = "schema")]
 fn schema_property_has_enum(schema: &Json, name: &str, expected: &[&str]) -> bool {
-    schema_property(schema, name)
-        .and_then(|property| property.get("enum"))
-        .and_then(Json::as_array)
-        .is_some_and(|values| {
-            expected
-                .iter()
-                .all(|expected| values.iter().any(|value| value == *expected))
-        })
+    schema_property_matches(schema, name, &|property| {
+        property
+            .get("enum")
+            .and_then(Json::as_array)
+            .is_some_and(|values| {
+                expected
+                    .iter()
+                    .all(|expected| values.iter().any(|value| value == *expected))
+            })
+    })
 }
 
 #[cfg(feature = "schema")]
 fn schema_property_has_default(schema: &Json, name: &str, expected: Json) -> bool {
-    schema_property(schema, name)
-        .and_then(|property| property.get("default"))
-        .is_some_and(|default| default == &expected)
+    schema_property_matches(schema, name, &|property| {
+        property
+            .get("default")
+            .is_some_and(|default| default == &expected)
+    })
+}
+
+#[cfg(feature = "schema")]
+fn schema_property_matches(schema: &Json, name: &str, predicate: &impl Fn(&Json) -> bool) -> bool {
+    match schema {
+        Json::Object(object) => {
+            if object
+                .get("properties")
+                .and_then(Json::as_object)
+                .and_then(|properties| properties.get(name))
+                .is_some_and(predicate)
+            {
+                return true;
+            }
+            object
+                .values()
+                .any(|value| schema_property_matches(value, name, predicate))
+        }
+        Json::Array(values) => values
+            .iter()
+            .any(|value| schema_property_matches(value, name, predicate)),
+        _ => false,
+    }
 }
 
 #[cfg(feature = "schema")]
@@ -193,6 +220,8 @@ fn default_config_and_component_conversion_cover_public_shape() {
 
     let otlp = OtlpSectionConfig::default();
     assert!(!otlp.enabled);
+    assert_eq!(otlp.mark_projection, MarkProjection::Inherit);
+    assert_eq!(otlp.mark_exclude_names, vec!["llm.chunk"]);
     assert_eq!(otlp.transport, "http_binary");
     assert_eq!(otlp.service_name, "nemo-relay");
     assert_eq!(otlp.timeout_millis, 3_000);
@@ -209,6 +238,55 @@ fn default_config_and_component_conversion_cover_public_shape() {
     assert!(generic.enabled);
     assert_eq!(generic.config["version"], json!(1));
     assert_eq!(generic.config["atif"]["agent_name"], json!("NeMo Relay"));
+}
+
+#[test]
+fn mark_projection_parses_for_otlp_and_rejects_unknown_values() {
+    let otlp: OtlpSectionConfig = serde_json::from_value(json!({
+        "mark_projection": "tool"
+    }))
+    .unwrap();
+    assert_eq!(otlp.mark_projection, MarkProjection::Tool);
+
+    let event: OtlpSectionConfig = serde_json::from_value(json!({
+        "mark_projection": "event",
+        "mark_exclude_names": []
+    }))
+    .unwrap();
+    assert_eq!(event.mark_projection, MarkProjection::Event);
+    assert!(event.mark_exclude_names.is_empty());
+
+    let custom_exclusions: OtlpSectionConfig = serde_json::from_value(json!({
+        "mark_projection": "tool",
+        "mark_exclude_names": ["notification", "hook_mark"]
+    }))
+    .unwrap();
+    assert_eq!(
+        custom_exclusions.mark_exclude_names,
+        vec!["notification", "hook_mark"]
+    );
+
+    let error = serde_json::from_value::<OtlpSectionConfig>(json!({
+        "mark_projection": "span"
+    }))
+    .unwrap_err();
+    assert!(error.to_string().contains("unknown variant `span`"));
+
+    let report = validate_plugin_config(&plugin_config(json!({
+        "opentelemetry": {"mark_projection": "span"}
+    })));
+    assert!(report.has_errors());
+    assert!(report.diagnostics.iter().any(|diagnostic| diagnostic.code
+        == "observability.invalid_plugin_config"
+        && diagnostic.message.contains("unknown variant `span`")));
+
+    let report = validate_plugin_config(&plugin_config(json!({
+        "atif": {"mark_projection": "tool"}
+    })));
+    assert!(report.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "observability.unknown_field"
+            && diagnostic.field.as_deref() == Some("mark_projection")
+    }));
 }
 
 #[cfg(feature = "schema")]
@@ -230,6 +308,8 @@ fn schema_contains_every_supported_observability_option() {
         "agent_name",
         "agent_version",
         "model_name",
+        "mark_projection",
+        "mark_exclude_names",
         "tool_definitions",
         "extra",
         "filename_template",
@@ -261,6 +341,11 @@ fn schema_contains_every_supported_observability_option() {
         &schema,
         "transport",
         &["http_binary", "grpc"]
+    ));
+    assert!(schema_property_has_enum(
+        &schema,
+        "mark_projection",
+        &["inherit", "event", "tool"]
     ));
     assert!(schema_property_has_default(
         &schema,
@@ -894,7 +979,7 @@ fn atif_routes_global_descendant_events_by_parent_uuid() {
 }
 
 #[test]
-fn atif_keeps_openclaw_child_only_fallback_as_a_top_level_trajectory() {
+fn atif_writes_openclaw_child_only_fallback_without_mark_steps() {
     let _guard = crate::observability::test_mutex().lock().unwrap();
     reset_runtime();
     let dir = temp_dir("observability-atif-openclaw-child-fallback");
@@ -998,8 +1083,7 @@ fn atif_keeps_openclaw_child_only_fallback_as_a_top_level_trajectory() {
 
     let value: Json = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
     assert_eq!(value["trajectory_id"], child_uuid.to_string());
-    assert_eq!(value["steps"].as_array().unwrap().len(), 1);
-    assert_eq!(value["steps"][0]["message"], "worker-started");
+    assert!(value["steps"].as_array().unwrap().is_empty());
     assert!(
         value.get("subagent_trajectories").is_none() || value["subagent_trajectories"].is_null()
     );

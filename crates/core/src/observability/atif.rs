@@ -22,7 +22,7 @@
 //! | LLM End         | `agent` step            | Response content, tool_calls promoted|
 //! | Tool Start      | *(skipped)*             | tool_calls come from LLM End instead |
 //! | Tool End        | agent observation         | Correlated by `source_call_id`       |
-//! | Mark (with data)| `system` step           | Custom event data preserved          |
+//! | Mark            | *(skipped)*             | Point-in-time telemetry is not a step|
 //! | Scope Start/End | *(skipped)*             | Structural events, not trajectory    |
 //!
 //! The exporter serializes the full collected event stream into a single ATIF
@@ -273,7 +273,10 @@ pub struct AtifStepExtra {
     /// Full raw LLM response payload for response-level fidelity.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub llm_response: Option<Json>,
-    /// Full raw point-in-time event payload for mark/system steps.
+    /// Legacy event payload field retained for source compatibility.
+    ///
+    /// The ATIF exporter does not translate point-in-time mark events into
+    /// trajectory steps, so exporter-produced steps leave this field unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_payload: Option<Json>,
     /// Per-tool callable lineage, aligned with `tool_calls`.
@@ -359,11 +362,14 @@ impl AtifExporter {
     /// [`register_subscriber`](crate::api::subscriber::register_subscriber).
     ///
     /// # Returns
-    /// An [`EventSubscriberFn`] that appends each observed event to this
-    /// exporter's internal buffer.
+    /// An [`EventSubscriberFn`] that appends compatible lifecycle events to
+    /// this exporter's internal buffer. Point-in-time marks are ignored.
     pub fn subscriber(&self) -> EventSubscriberFn {
         let state = self.state.clone();
         Arc::new(move |event: &Event| {
+            if matches!(event, Event::Mark(_)) {
+                return;
+            }
             if let Ok(mut s) = state.lock() {
                 s.events.push(event.clone());
             }
@@ -2004,7 +2010,6 @@ impl StepConversionState {
             ("scope", Some(crate::api::event::ScopeCategory::End), Some("tool")) => {
                 self.handle_tool_end(event, lookups)
             }
-            ("mark", _, _) => self.handle_mark(event, lookups),
             _ => {}
         }
     }
@@ -2585,49 +2590,6 @@ impl StepConversionState {
             Some(source_call_id.to_string()),
         ));
         true
-    }
-
-    fn handle_mark(&mut self, mark: &Event, lookups: &EventLookupMaps) {
-        if is_llm_chunk_mark(mark) {
-            return;
-        }
-        self.flush_observations();
-        let Some(data) = mark.data() else {
-            return;
-        };
-        if is_empty_mark_payload(data) {
-            return;
-        }
-        let extra = AtifStepExtra {
-            ancestry: build_ancestry(mark, &lookups.name_map),
-            invocation: Some(AtifInvocationInfo {
-                start_timestamp: None,
-                end_timestamp: None,
-                invocation_id: Some(mark.uuid().to_string()),
-                status: Some("completed".to_string()),
-                framework: Some("nemo_relay".to_string()),
-            }),
-            llm_request: None,
-            llm_response: None,
-            event_payload: Some(data.clone()),
-            tool_ancestry: Vec::new(),
-            tool_invocations: None,
-        };
-        self.steps.push(AtifStep {
-            step_id: 0,
-            source: "system".to_string(),
-            message: mark_message(mark, data),
-            timestamp: Some(mark.timestamp().to_rfc3339()),
-            model_name: None,
-            reasoning_effort: None,
-            reasoning_content: None,
-            tool_calls: None,
-            observation: None,
-            metrics: None,
-            llm_call_count: None,
-            is_copied_context: None,
-            extra: serde_json::to_value(&extra).ok(),
-        });
     }
 
     fn handle_subagent_start(&mut self, child: &AgentScopeNode, event: &Event) {
@@ -3218,7 +3180,7 @@ fn is_step_event(event: &Event) -> bool {
             "scope",
             Some(crate::api::event::ScopeCategory::End),
             Some("tool")
-        ) | ("mark", _, _)
+        )
     )
 }
 
@@ -3352,8 +3314,7 @@ fn events_to_steps_for_agent(
 ///      step with multiple results
 /// 4. Tool End observation results are correlated with the preceding LLM End's
 ///    promoted tool_calls by function name → `source_call_id`.
-/// 5. Mark events → system steps if they carry data.
-/// 6. Scope Start/End → skipped.
+/// 5. Mark and other Scope Start/End events → skipped.
 fn events_to_steps(events: &[&Event]) -> Vec<AtifStep> {
     let mut sorted: Vec<&Event> = events.to_vec();
     sorted.sort_by_key(|e| *e.timestamp());
@@ -3365,41 +3326,6 @@ fn events_to_steps(events: &[&Event]) -> Vec<AtifStep> {
     }
 
     state.finish()
-}
-
-fn is_empty_mark_payload(data: &Json) -> bool {
-    data.is_null() || data.as_object().is_some_and(|object| object.is_empty())
-}
-
-fn is_llm_chunk_mark(mark: &Event) -> bool {
-    mark.name() == "llm.chunk"
-        || mark
-            .metadata()
-            .and_then(Json::as_object)
-            .and_then(|metadata| metadata.get("hook_event_name"))
-            .and_then(Json::as_str)
-            == Some("llm.chunk")
-}
-
-// A runtime mark is point-in-time telemetry rather than a scoped call with start/end events. Agent
-// hook adapters use marks for lifecycle notifications that do not map to first-class ATIF step
-// types, for example hook-only status updates or synthetic fallback events. The ATIF step message
-// stays schema-compatible while the original payload is preserved in `Step.extra.event_payload`.
-fn mark_message(mark: &Event, _data: &Json) -> Json {
-    Json::String(mark_hook_event_name(mark).unwrap_or_default())
-}
-
-// Prefer the adapter-provided hook name because the runtime mark name may be a generic bucket such
-// as `hook_mark` or a synthetic fallback like `subagent_end_without_start`. Falling back to the mark
-// name keeps non-hook marks readable without making this exporter depend on any one agent adapter.
-fn mark_hook_event_name(mark: &Event) -> Option<String> {
-    mark.metadata()
-        .and_then(Json::as_object)
-        .and_then(|metadata| metadata.get("hook_event_name"))
-        .and_then(Json::as_str)
-        .filter(|name| !name.is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| Some(mark.name().to_string()).filter(|name| !name.is_empty()))
 }
 
 fn is_start_event(event: &Event) -> bool {

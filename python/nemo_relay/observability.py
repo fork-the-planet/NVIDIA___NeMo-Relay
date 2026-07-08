@@ -10,6 +10,8 @@ from typing import Literal, Protocol, cast
 
 from nemo_relay import Json, JsonObject, UnsupportedBehavior
 
+MarkProjection = Literal["inherit", "event", "tool"]
+
 
 class _SupportsToDict(Protocol):
     def to_dict(self) -> JsonObject: ...
@@ -194,6 +196,8 @@ class OtlpConfig:
     """Shared OpenTelemetry/OpenInference OTLP export settings."""
 
     enabled: bool = False
+    mark_projection: MarkProjection = "inherit"
+    mark_exclude_names: list[str] = field(default_factory=lambda: ["llm.chunk"])
     transport: Literal["http_binary", "grpc"] = "http_binary"
     endpoint: str | None = None
     headers: dict[str, str] = field(default_factory=dict)
@@ -209,6 +213,8 @@ class OtlpConfig:
         return _normalize_object(
             {
                 "enabled": self.enabled,
+                "mark_projection": self.mark_projection,
+                "mark_exclude_names": self.mark_exclude_names,
                 "transport": self.transport,
                 "endpoint": self.endpoint,
                 "headers": self.headers,
@@ -272,6 +278,7 @@ __all__ = [
     "AtofConfig",
     "AtifConfig",
     "HttpStorageConfig",
+    "MarkProjection",
     "S3StorageConfig",
     "OtlpConfig",
     "ObservabilityConfig",
