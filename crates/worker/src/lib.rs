@@ -19,7 +19,7 @@
 //! arbitrary blocking work started by the callback has stopped.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::{SocketAddr, ToSocketAddrs};
 #[cfg(unix)]
@@ -34,7 +34,7 @@ use futures_util::{Stream, StreamExt};
 #[cfg(unix)]
 use hyper_util::rt::TokioIo;
 pub use nemo_relay_types::Json;
-pub use nemo_relay_types::api::event::{Event, PendingMarkSpec};
+pub use nemo_relay_types::api::event::{Event, EventSanitizeFields, PendingMarkSpec};
 pub use nemo_relay_types::api::llm::{LlmRequest, LlmRequestInterceptOutcome};
 pub use nemo_relay_types::api::scope::ScopeType;
 pub use nemo_relay_types::api::tool::ToolExecutionInterceptOutcome;
@@ -118,6 +118,8 @@ pub trait WorkerPlugin: Send + Sync + 'static {
 }
 
 type SubscriberFn = Arc<dyn Fn(&Event) + Send + Sync>;
+type EventSanitizeFn =
+    Arc<dyn Fn(&Event, EventSanitizeFields) -> EventSanitizeFields + Send + Sync>;
 type ToolSanitizeFn = Arc<dyn Fn(&str, Json) -> Json + Send + Sync>;
 type ToolConditionalFn = Arc<dyn Fn(&str, &Json) -> Result<Option<String>> + Send + Sync>;
 type ToolRequestFn = Arc<dyn Fn(&str, Json) -> Result<Json> + Send + Sync>;
@@ -140,6 +142,9 @@ type LlmStreamExecutionFn =
 struct WorkerHandlers {
     registrations: Vec<Registration>,
     subscribers: HashMap<String, SubscriberFn>,
+    mark_sanitizers: HashMap<String, EventSanitizeFn>,
+    scope_start_sanitizers: HashMap<String, EventSanitizeFn>,
+    scope_end_sanitizers: HashMap<String, EventSanitizeFn>,
     tool_sanitize_requests: HashMap<String, ToolSanitizeFn>,
     tool_sanitize_responses: HashMap<String, ToolSanitizeFn>,
     tool_conditionals: HashMap<String, ToolConditionalFn>,
@@ -190,6 +195,76 @@ impl PluginContext {
         self.handlers
             .subscribers
             .insert(name.into(), Arc::new(callback));
+    }
+
+    fn register_event_sanitizer<F>(
+        &mut self,
+        name: &str,
+        priority: i32,
+        surface: RegistrationSurface,
+        callback: F,
+    ) where
+        F: Fn(&Event, EventSanitizeFields) -> EventSanitizeFields + Send + Sync + 'static,
+    {
+        self.push_registration(name, surface, priority, false);
+        let sanitizers = match surface {
+            RegistrationSurface::MarkSanitizeGuardrail => &mut self.handlers.mark_sanitizers,
+            RegistrationSurface::ScopeSanitizeStartGuardrail => {
+                &mut self.handlers.scope_start_sanitizers
+            }
+            RegistrationSurface::ScopeSanitizeEndGuardrail => {
+                &mut self.handlers.scope_end_sanitizers
+            }
+            _ => unreachable!("event sanitizer registration requires an event sanitizer surface"),
+        };
+        sanitizers.insert(name.into(), Arc::new(callback));
+    }
+
+    /// Registers a mark event sanitizer.
+    pub fn register_mark_sanitize_guardrail<F>(&mut self, name: &str, priority: i32, callback: F)
+    where
+        F: Fn(&Event, EventSanitizeFields) -> EventSanitizeFields + Send + Sync + 'static,
+    {
+        self.register_event_sanitizer(
+            name,
+            priority,
+            RegistrationSurface::MarkSanitizeGuardrail,
+            callback,
+        );
+    }
+
+    /// Registers a scope-start event sanitizer.
+    pub fn register_scope_sanitize_start_guardrail<F>(
+        &mut self,
+        name: &str,
+        priority: i32,
+        callback: F,
+    ) where
+        F: Fn(&Event, EventSanitizeFields) -> EventSanitizeFields + Send + Sync + 'static,
+    {
+        self.register_event_sanitizer(
+            name,
+            priority,
+            RegistrationSurface::ScopeSanitizeStartGuardrail,
+            callback,
+        );
+    }
+
+    /// Registers a scope-end event sanitizer.
+    pub fn register_scope_sanitize_end_guardrail<F>(
+        &mut self,
+        name: &str,
+        priority: i32,
+        callback: F,
+    ) where
+        F: Fn(&Event, EventSanitizeFields) -> EventSanitizeFields + Send + Sync + 'static,
+    {
+        self.register_event_sanitizer(
+            name,
+            priority,
+            RegistrationSurface::ScopeSanitizeEndGuardrail,
+            callback,
+        );
     }
 
     /// Registers a tool sanitize-request guardrail.
@@ -968,6 +1043,12 @@ impl PluginWorker for WorkerService {
                 error: Some(sdk_error_to_worker(err)),
             }));
         }
+        if let Err(err) = validate_unique_registrations(&ctx.handlers.registrations) {
+            return Ok(Response::new(RegisterResponse {
+                registrations: Vec::new(),
+                error: Some(sdk_error_to_worker(err)),
+            }));
+        }
         let registrations = ctx.handlers.registrations.clone();
         *self
             .handlers
@@ -1230,6 +1311,21 @@ impl PluginWorker for WorkerService {
     }
 }
 
+fn validate_unique_registrations(registrations: &[Registration]) -> Result<()> {
+    let mut seen = HashSet::new();
+    for registration in registrations {
+        if !seen.insert((registration.surface, registration.local_name.as_str())) {
+            let surface = RegistrationSurface::try_from(registration.surface)
+                .map_or("UNKNOWN", |surface| surface.as_str_name());
+            return Err(WorkerSdkError::InvalidInput(format!(
+                "duplicate registration '{}' for surface {}",
+                registration.local_name, surface
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl WorkerService {
     fn authorize(&self, activation_id: &str, auth_token: &str) -> std::result::Result<(), Status> {
         if activation_id != self.runtime.activation_id {
@@ -1333,6 +1429,18 @@ impl WorkerService {
                 let handler = self.subscriber(&request.registration_name)?;
                 with_thread_scope(&scope, || handler(&event));
                 Ok(empty_response())
+            }
+            RegistrationSurface::MarkSanitizeGuardrail
+            | RegistrationSurface::ScopeSanitizeStartGuardrail
+            | RegistrationSurface::ScopeSanitizeEndGuardrail => {
+                let event = event_payload(request.payload)?;
+                let fields = event.sanitize_fields();
+                let handler = self.event_sanitizer(surface, &request.registration_name)?;
+                let fields = with_thread_scope(&scope, || handler(&event, fields));
+                Ok(json_response(
+                    serde_json::to_value(fields)
+                        .expect("event sanitize fields are JSON serializable"),
+                ))
             }
             RegistrationSurface::ToolSanitizeRequestGuardrail => {
                 let payload = tool_payload(request.payload)?;
@@ -1441,6 +1549,22 @@ impl WorkerService {
             .ok_or_else(|| {
                 WorkerSdkError::InvalidInput(format!("subscriber '{name}' not registered"))
             })
+    }
+
+    fn event_sanitizer(&self, surface: RegistrationSurface, name: &str) -> Result<EventSanitizeFn> {
+        let handlers = self
+            .handlers
+            .lock()
+            .map_err(|err| WorkerSdkError::Callback(format!("handler lock poisoned: {err}")))?;
+        let sanitizers = match surface {
+            RegistrationSurface::MarkSanitizeGuardrail => &handlers.mark_sanitizers,
+            RegistrationSurface::ScopeSanitizeStartGuardrail => &handlers.scope_start_sanitizers,
+            RegistrationSurface::ScopeSanitizeEndGuardrail => &handlers.scope_end_sanitizers,
+            _ => unreachable!("event sanitizer lookup requires an event sanitizer surface"),
+        };
+        sanitizers.get(name).cloned().ok_or_else(|| {
+            WorkerSdkError::InvalidInput(format!("event sanitizer '{name}' not registered"))
+        })
     }
 
     fn tool_sanitize_request(&self, name: &str) -> Result<ToolSanitizeFn> {
@@ -1919,6 +2043,9 @@ fn all_surfaces() -> Vec<RegistrationSurface> {
         RegistrationSurface::LlmRequestIntercept,
         RegistrationSurface::LlmExecutionIntercept,
         RegistrationSurface::LlmStreamExecutionIntercept,
+        RegistrationSurface::MarkSanitizeGuardrail,
+        RegistrationSurface::ScopeSanitizeStartGuardrail,
+        RegistrationSurface::ScopeSanitizeEndGuardrail,
     ]
 }
 

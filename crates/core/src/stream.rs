@@ -37,6 +37,7 @@ use crate::api::runtime::NemoRelayContextState;
 use crate::api::runtime::global_context;
 use crate::api::runtime::{EventSubscriberFn, ScopeStackHandle, current_scope_stack};
 use crate::api::shared::metadata_with_otel_status;
+use crate::api::shared::sanitize_event_with_scope_stack;
 use crate::codec::response::{AnnotatedLlmResponse, attach_estimated_cost_for_provider};
 use crate::codec::traits::LlmResponseCodec;
 use crate::error::Result;
@@ -226,7 +227,9 @@ impl LlmStreamWrapper {
                 Err(_) => None,
             }
         };
-        if let Some(event) = event_snapshot {
+        if let Some(event) = event_snapshot
+            && let Some(event) = sanitize_event_with_scope_stack(event, &self.scope_stack)
+        {
             NemoRelayContextState::emit_event(&event, &self.subscribers);
         }
     }
@@ -253,7 +256,9 @@ impl LlmStreamWrapper {
                 Err(_) => None,
             }
         };
-        if let Some(event) = event_snapshot {
+        if let Some(event) = event_snapshot
+            && let Some(event) = sanitize_event_with_scope_stack(event, &self.scope_stack)
+        {
             NemoRelayContextState::emit_event(&event, &self.subscribers);
         }
     }

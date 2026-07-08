@@ -21,7 +21,8 @@ use crate::api::scope::event;
 use crate::api::scope::{EmitMarkEventParams, ScopeHandle};
 use crate::api::shared::{
     ensure_runtime_owner, inject_dynamo_session_ids, metadata_with_otel_status,
-    resolve_parent_uuid, run_request_intercepts_with_codec, snapshot_event_subscribers,
+    resolve_parent_uuid, run_request_intercepts_with_codec, sanitize_event,
+    snapshot_event_subscribers,
 };
 use crate::codec::request::AnnotatedLlmRequest;
 use crate::codec::response::{AnnotatedLlmResponse, attach_estimated_cost_for_provider};
@@ -320,7 +321,9 @@ fn emit_llm_start_with_subscribers(
             .map_err(|error| FlowError::Internal(error.to_string()))?;
         state.build_llm_start_event(handle, Some(input), annotated_request)
     };
-    NemoRelayContextState::emit_event(&event, subscribers);
+    if let Some(event) = sanitize_event(event) {
+        NemoRelayContextState::emit_event(&event, subscribers);
+    }
     Ok(())
 }
 
@@ -346,7 +349,9 @@ fn emit_pending_request_marks(
             mark.category,
             mark.category_profile,
         ));
-        NemoRelayContextState::emit_event(&event, subscribers);
+        if let Some(event) = sanitize_event(event) {
+            NemoRelayContextState::emit_event(&event, subscribers);
+        }
     }
     Ok(())
 }
@@ -519,7 +524,9 @@ fn llm_call_end_with_behavior(
                 .build(),
         )
     };
-    NemoRelayContextState::emit_event(&event, &subscribers);
+    if let Some(event) = sanitize_event(event) {
+        NemoRelayContextState::emit_event(&event, &subscribers);
+    }
     if let Some(error) = decode_error
         && behavior.response_codec_errors_fatal
     {
@@ -550,7 +557,9 @@ fn emit_llm_end_without_output(
         let event = state.end_llm_handle(handle, handle.data.clone(), metadata, None);
         (event, subscribers)
     };
-    NemoRelayContextState::emit_event(&event, &subscribers);
+    if let Some(event) = sanitize_event(event) {
+        NemoRelayContextState::emit_event(&event, &subscribers);
+    }
     Ok(())
 }
 
