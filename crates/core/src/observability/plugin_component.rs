@@ -54,7 +54,9 @@ use crate::observability::openinference::{
 use crate::observability::otel::{
     OpenTelemetryConfig as CoreOpenTelemetryConfig, OpenTelemetrySubscriber,
 };
-use crate::observability::{MarkProjection, default_mark_exclude_names};
+use crate::observability::{
+    MarkProjection, OtlpAttributeMapping, default_mark_exclude_names, validate_attribute_mappings,
+};
 use crate::plugin::{
     ConfigDiagnostic, ConfigPolicy, DiagnosticLevel, Plugin, PluginComponentSpec, PluginError,
     PluginRegistration, PluginRegistrationContext, Result as PluginResult, UnsupportedBehavior,
@@ -392,6 +394,9 @@ pub struct OtlpSectionConfig {
     /// Mark names excluded from tool projection. Defaults to `llm.chunk`.
     #[serde(default = "default_mark_exclude_names")]
     pub mark_exclude_names: Vec<String>,
+    /// Typed projected attributes copied to aliases.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attribute_mappings: Vec<OtlpAttributeMapping>,
     /// OTLP transport: `http_binary` or `grpc`.
     #[serde(default = "default_otlp_transport")]
     #[cfg_attr(feature = "schema", schemars(schema_with = "otlp_transport_schema"))]
@@ -428,6 +433,7 @@ impl Default for OtlpSectionConfig {
             enabled: false,
             mark_projection: MarkProjection::default(),
             mark_exclude_names: default_mark_exclude_names(),
+            attribute_mappings: Vec::new(),
             transport: default_otlp_transport(),
             endpoint: None,
             headers: HashMap::new(),
@@ -565,10 +571,36 @@ static ATOF_SINK_LIST: EditorListItemSpec = EditorListItemSpec {
 };
 
 crate::editor_config! {
+    impl OtlpAttributeMapping {
+        key => { label: "key", kind: String },
+        alias => { label: "alias", kind: String },
+    }
+}
+
+fn otlp_attribute_mapping_editor_schema() -> &'static crate::config_editor::EditorSchema {
+    <OtlpAttributeMapping as crate::config_editor::EditorConfig>::editor_schema()
+}
+
+fn default_otlp_attribute_mapping() -> Json {
+    serde_json::to_value(OtlpAttributeMapping::new("", ""))
+        .expect("attribute mapping should serialize")
+}
+
+static OTLP_ATTRIBUTE_MAPPING_LIST_ITEM: crate::config_editor::EditorListItemSpec =
+    crate::config_editor::EditorListItemSpec {
+        kind: crate::config_editor::EditorFieldKind::Section,
+        schema: Some(otlp_attribute_mapping_editor_schema),
+        default: Some(default_otlp_attribute_mapping),
+        tagged_union: None,
+        list_item: None,
+    };
+
+crate::editor_config! {
     impl OtlpSectionConfig {
         enabled => { label: "enabled", kind: Boolean },
         mark_projection => { label: "mark_projection", kind: Enum, values: ["inherit", "event", "tool"] },
         mark_exclude_names => { label: "mark_exclude_names", kind: Json },
+        attribute_mappings => { label: "attribute_mappings", kind: List, list: &OTLP_ATTRIBUTE_MAPPING_LIST_ITEM },
         transport => { label: "transport", kind: Enum, values: ["http_binary", "grpc"] },
         endpoint => { label: "endpoint", kind: String, optional: true },
         headers => { label: "headers", kind: StringMap },
@@ -1463,7 +1495,8 @@ fn build_otel_config(section: OtlpSectionConfig) -> PluginResult<CoreOpenTelemet
     .with_timeout(Duration::from_millis(section.timeout_millis));
     config = config
         .with_mark_projection(section.mark_projection)
-        .with_mark_exclude_names(section.mark_exclude_names);
+        .with_mark_exclude_names(section.mark_exclude_names)
+        .with_attribute_mappings(section.attribute_mappings);
 
     if let Some(endpoint) = section.endpoint {
         config = config.with_endpoint(endpoint);
@@ -1502,7 +1535,8 @@ fn build_openinference_config(section: OtlpSectionConfig) -> PluginResult<CoreOp
         .with_service_name(section.service_name)
         .with_timeout(Duration::from_millis(section.timeout_millis))
         .with_mark_projection(section.mark_projection)
-        .with_mark_exclude_names(section.mark_exclude_names);
+        .with_mark_exclude_names(section.mark_exclude_names)
+        .with_attribute_mappings(section.attribute_mappings);
 
     if let Some(endpoint) = section.endpoint {
         config = config.with_endpoint(endpoint);
@@ -1634,6 +1668,7 @@ fn validate_observability_section_fields(
             "enabled",
             "mark_projection",
             "mark_exclude_names",
+            "attribute_mappings",
             "transport",
             "endpoint",
             "headers",
@@ -1654,6 +1689,7 @@ fn validate_observability_section_fields(
             "enabled",
             "mark_projection",
             "mark_exclude_names",
+            "attribute_mappings",
             "transport",
             "endpoint",
             "headers",
@@ -2386,6 +2422,16 @@ fn validate_otlp_values(
             Some(section_name.to_string()),
             Some("transport".to_string()),
             format!("{section_name} transport must be 'http_binary' or 'grpc'"),
+        );
+    }
+    if let Err(message) = validate_attribute_mappings(&section.attribute_mappings) {
+        push_policy_diag(
+            diagnostics,
+            policy.unsupported_value,
+            "observability.unsupported_value",
+            Some(section_name.to_string()),
+            Some("attribute_mappings".to_string()),
+            message,
         );
     }
 }

@@ -227,6 +227,7 @@ class OtlpConfig:
     service_version: str | None = None
     instrumentation_scope: str | None = None
     timeout_millis: int = 3000
+    attribute_mappings: list[dict[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> JsonObject:
         """Serialize this OTLP config to the canonical JSON object shape."""
@@ -235,6 +236,7 @@ class OtlpConfig:
                 "enabled": self.enabled,
                 "mark_projection": self.mark_projection,
                 "mark_exclude_names": self.mark_exclude_names,
+                "attribute_mappings": self.attribute_mappings,
                 "transport": self.transport,
                 "endpoint": self.endpoint,
                 "headers": self.headers,
